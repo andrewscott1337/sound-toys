@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Theremin</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #0a0f19;
+    color: #e0e6f0;
+    overflow: hidden;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: none;
+  }
+
+  .stage {
+    position: fixed;
+    inset: 0;
+    cursor: crosshair;
+    background:
+      radial-gradient(circle at var(--mx, 50%) var(--my, 50%), var(--glow-tint, rgba(88, 166, 255, 0.18)), transparent 60%),
+      #0a0f19;
+    transition: background 0.12s linear;
+  }
+
+  /* Canvas layer holds the grid, trail ribbon and waveform halo */
+  #fx {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+  }
+
+  .pointer-glow {
+    position: absolute;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: radial-gradient(circle, #fff 0%, var(--glow-mid, rgba(88,166,255,0.6)) 40%, transparent 70%);
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+    transition: transform 0.05s linear;
+    box-shadow: 0 0 32px var(--glow-shadow, rgba(88,166,255,0.7));
+    opacity: 0;
+  }
+  .pointer-glow.on { opacity: 1; }
+
+  .panel {
+    position: fixed;
+    top: 16px;
+    left: 16px;
+    right: 16px;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+    z-index: 10;
+    pointer-events: none;
+  }
+  .panel > * { pointer-events: auto; }
+  .title {
+    font-weight: 700;
+    font-size: 1.1rem;
+    letter-spacing: -0.01em;
+  }
+  .readout {
+    background: rgba(10,15,25,0.7);
+    backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 8px;
+    padding: 6px 12px;
+    font-size: 0.85rem;
+    font-variant-numeric: tabular-nums;
+    color: #aab2c0;
+  }
+  .readout strong { color: #fff; transition: color 0.12s linear; }
+  .scale-pick {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.1);
+    color: #e0e6f0;
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  .scale-pick:focus { outline: 1px solid rgba(88,166,255,0.5); }
+
+  .hint {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 0.85rem;
+    color: rgba(255,255,255,0.5);
+    text-align: center;
+    pointer-events: none;
+    z-index: 10;
+    transition: opacity 0.4s;
+  }
+  .hint.hidden { opacity: 0; }
+</style>
+</head>
+<body>
+<script>
+/* ── Robust mobile audio unlock (shared across the sound toys) ──────────
+   Phones keep Web Audio silent until a media session is opened by a real
+   user gesture, and the iPhone ring/silent switch mutes Web Audio unless a
+   media element is playing. This tracks every AudioContext the page creates,
+   and on the first touch resumes it, primes it with a one-sample buffer, and
+   loops a silent <audio> element so iOS routes Web Audio to the speaker.
+   Additive and harmless on desktop / Android. */
+(function () {
+  var AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  var ctxs = [];
+  try {
+    var P = new Proxy(AC, { construct: function (T, a) {
+      var c = Reflect.construct(T, a); ctxs.push(c); return c;
+    } });
+    window.AudioContext = P;
+    if (window.webkitAudioContext) window.webkitAudioContext = P;
+  } catch (e) { /* no Proxy: still flip the session below */ }
+  function silentWav() {
+    var sr = 8000, n = Math.floor(sr * 0.25), bytes = 44 + n * 2;
+    var b = new ArrayBuffer(bytes), v = new DataView(b);
+    var w = function (o, s) { for (var i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    w(0, 'RIFF'); v.setUint32(4, bytes - 8, true); w(8, 'WAVE'); w(12, 'fmt ');
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    w(36, 'data'); v.setUint32(40, n * 2, true);
+    var u8 = new Uint8Array(b), bin = '';
+    for (var i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]);
+    return 'data:audio/wav;base64,' + btoa(bin);
+  }
+  var el = null;
+  function unlock() {
+    try {
+      if (!el) {
+        el = document.createElement('audio');
+        el.setAttribute('playsinline', ''); el.loop = true; el.preload = 'auto';
+        el.src = silentWav(); el.style.display = 'none';
+        (document.body || document.documentElement).appendChild(el);
+      }
+      var pr = el.play(); if (pr && pr.catch) pr.catch(function () {});
+    } catch (e) {}
+    for (var i = 0; i < ctxs.length; i++) {
+      var c = ctxs[i];
+      try {
+        if (c.state === 'suspended') c.resume();
+        var buf = c.createBuffer(1, 1, 22050), s = c.createBufferSource();
+        s.buffer = buf; s.connect(c.destination); s.start(0);
+      } catch (e) {}
+    }
+  }
+  ['touchend', 'touchstart', 'pointerdown', 'mousedown', 'click', 'keydown'].forEach(function (ev) {
+    document.addEventListener(ev, unlock, true);
+  });
+})();
+</script>
+
+
+<div class="stage" id="stage">
+  <canvas id="fx"></canvas>
+  <div class="pointer-glow" id="glow"></div>
+</div>
+
+<div class="panel">
+  <div class="title">Theremin</div>
+  <div class="readout"><strong id="hzOut">&mdash;</strong> &nbsp;<span id="noteOut">silent</span></div>
+  <select class="scale-pick" id="scalePick">
+    <option value="off">Continuous (no snap)</option>
+    <option value="chromatic">Chromatic</option>
+    <option value="major" selected>C major</option>
+    <option value="minor">C minor</option>
+    <option value="pent">Pentatonic</option>
+    <option value="bp">Bohlen&ndash;Pierce</option>
+  </select>
+  <select class="scale-pick" id="timbrePick" title="Oscillator timbre">
+    <option value="sine" selected>Sine</option>
+    <option value="triangle">Triangle</option>
+    <option value="sawtooth">Sawtooth</option>
+    <option value="square">Square</option>
+  </select>
+</div>
+
+<div class="hint" id="hint">Move horizontally for pitch, vertically for volume. Release to stop.</div>
+
+<script>
+  const F_MIN = 110;   // A2
+  const F_MAX = 1760;  // A6
+  const logMin = Math.log2(F_MIN);
+  const logMax = Math.log2(F_MAX);
+
+  const stage = document.getElementById('stage');
+  const glow = document.getElementById('glow');
+  const fx = document.getElementById('fx');
+  const fxc = fx.getContext('2d');
+  const hzOut = document.getElementById('hzOut');
+  const noteOut = document.getElementById('noteOut');
+  const scalePick = document.getElementById('scalePick');
+  const timbrePick = document.getElementById('timbrePick');
+  const hint = document.getElementById('hint');
+
+  const reduceMotion = window.matchMedia &&
+    window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // ---------- Sound -> Colour engine ----------
+  // Maps an audio frequency -> colour (chromatic / octave-cycling, like "Resonance").
+  // hue = pitch class (position within the octave); higher octave + louder = more saturated/bright.
+  function pitchColor(freq, amp = 1, alpha = 1) {
+    const ANCHOR = 65.41; // C2 -> hue 0 (red), per Scriabin C=red
+    const octavePos = Math.log2(Math.max(1e-6, freq) / ANCHOR);
+    const hue = ((octavePos % 1) * 360 + 360) % 360;
+    const octave = Math.max(0, Math.min(5, octavePos));
+    const sat = Math.min(100, 55 + octave * 6 + amp * 25);
+    const light = 38 + amp * 24;
+    return alpha >= 1 ? `hsl(${hue}, ${sat}%, ${light}%)` : `hsla(${hue}, ${sat}%, ${light}%, ${alpha})`;
+  }
+  // Expose the hue alone when building bespoke colours (e.g. the grid ruler).
+  function pitchHue(freq) {
+    const ANCHOR = 65.41;
+    return ((Math.log2(Math.max(1e-6, freq) / ANCHOR) % 1) * 360 + 360) % 360;
+  }
+
+  // ---------- Audio ----------
+  let ctx = null, osc, gain;
+  let oscType = 'sine';
+  function ensure() {
+    if (ctx) return;
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    osc = ctx.createOscillator();
+    osc.type = oscType;
+    osc.frequency.value = 440;
+    gain = ctx.createGain();
+    gain.gain.value = 0;
+    osc.connect(gain).connect(ctx.destination);
+    osc.start();
+  }
+
+  function setFreq(hz) {
+    if (!ctx) return;
+    osc.frequency.setTargetAtTime(hz, ctx.currentTime, 0.01);
+  }
+  function setGain(v) {
+    if (!ctx) return;
+    gain.gain.setTargetAtTime(v, ctx.currentTime, 0.02);
+  }
+
+  timbrePick.addEventListener('change', () => {
+    oscType = timbrePick.value;
+    if (osc) osc.type = oscType;
+  });
+
+  // ---------- Scale snapping ----------
+  // Semitone intervals from C in each scale.
+  const SCALES = {
+    chromatic: [0,1,2,3,4,5,6,7,8,9,10,11],
+    major:     [0,2,4,5,7,9,11],
+    minor:     [0,2,3,5,7,8,10],
+    pent:      [0,2,4,7,9],
+  };
+
+  function snapFreq(hz, scale) {
+    if (scale === 'off') return hz;
+    if (scale === 'bp') {
+      // Bohlen-Pierce: 13 equal divisions of a tritave (3:1).
+      const ratio = hz / F_MIN;
+      const stepLog = Math.log(3) / 13;
+      const n = Math.round(Math.log(ratio) / stepLog);
+      return F_MIN * Math.exp(n * stepLog);
+    }
+    const set = SCALES[scale];
+    // Convert hz to semitones above C0 (16.351 Hz).
+    const C0 = 16.3516;
+    const semitones = 12 * Math.log2(hz / C0);
+    const octave = Math.floor(semitones / 12);
+    const pc = semitones - octave * 12;
+    // Find closest pitch class in set.
+    let best = set[0], bestDist = Infinity;
+    for (const s of set) {
+      const d = Math.min(Math.abs(s - pc), Math.abs(s + 12 - pc), Math.abs(s - 12 - pc));
+      if (d < bestDist) { best = s; bestDist = d; }
+    }
+    // If the closest match was via the next octave wrap, fix the octave.
+    let snapPc = best;
+    let snapOct = octave;
+    if (Math.abs(snapPc - pc) > 6) {
+      if (snapPc < pc) { snapPc += 12; }
+      else { snapPc -= 12; }
+    }
+    return C0 * Math.pow(2, (snapOct * 12 + snapPc) / 12);
+  }
+
+  // Name a frequency.
+  const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+  function nameOf(hz) {
+    const C0 = 16.3516;
+    const semitones = Math.round(12 * Math.log2(hz / C0));
+    const octave = Math.floor(semitones / 12);
+    const pc = ((semitones % 12) + 12) % 12;
+    return `${NOTE_NAMES[pc]}${octave}`;
+  }
+
+  // ---------- Grid (rendered on canvas as a faint rainbow ruler) ----------
+  // Each line carries the frequency at its x so we can tint it by pitchHue.
+  let gridLines = []; // { x01, hz, snap, label }
+  function buildGrid() {
+    gridLines = [];
+    const C0 = 16.3516;
+    const scale = scalePick.value;
+    const set = scale === 'off' ? null
+              : scale === 'bp' ? null
+              : SCALES[scale];
+
+    if (scale === 'bp') {
+      for (let n = 0; n < 4; n++) {
+        const hz = F_MIN * Math.pow(3, n);
+        const pos = (Math.log2(hz) - logMin) / (logMax - logMin);
+        if (pos < 0 || pos > 1) continue;
+        gridLines.push({ x01: pos, hz, snap: false, label: null });
+      }
+      return;
+    }
+
+    for (let semi = Math.floor(12 * Math.log2(F_MIN / C0)); semi <= Math.ceil(12 * Math.log2(F_MAX / C0)); semi++) {
+      const hz = C0 * Math.pow(2, semi / 12);
+      const pos = (Math.log2(hz) - logMin) / (logMax - logMin);
+      if (pos < 0 || pos > 1) continue;
+      const pc = ((semi % 12) + 12) % 12;
+      const isOctave = pc === 0;
+      const inScale = set ? set.includes(pc) : false;
+      if (!isOctave && !inScale) continue;
+      gridLines.push({
+        x01: pos,
+        hz,
+        snap: inScale && !isOctave,
+        label: isOctave ? nameOf(hz) : null
+      });
+    }
+  }
+
+  // ---------- Pointer, MIDI, and Keyboard handling ----------
+  let active = false;
+  let pointerActive = false;
+  // Live, smoothed audio state (target vs current) drives all colour.
+  let targetHz = 440, targetVol = 0;
+  let curHz = 440, curVol = 0;
+  let pointer01 = { x: 0.5, y: 0.5 };
+
+  // Trail ribbon: ring buffer of recent {x, y, hz, vol, born}.
+  const TRAIL_MAX = 60;
+  const trail = [];
+
+  function setFromPos(x, y) {
+    const rect = stage.getBoundingClientRect();
+    const rx = Math.max(0, Math.min(1, (x - rect.left) / rect.width));
+    const ry = Math.max(0, Math.min(1, (y - rect.top) / rect.height));
+    const rawHz = Math.pow(2, logMin + rx * (logMax - logMin));
+    const hz = snapFreq(rawHz, scalePick.value);
+    // Volume: top = loud, bottom = quiet, with a curve.
+    const vol = Math.pow(1 - ry, 1.7) * 0.4;
+    setFromHzAndVol(hz, vol);
+  }
+
+  function setFromHzAndVol(hz, vol) {
+    setFreq(hz);
+    setGain(vol);
+
+    targetHz = hz;
+    targetVol = vol;
+    // Recompute the snapped x so the glow lands on the actual note.
+    const snappedX = Math.max(0, Math.min(1, (Math.log2(hz) - logMin) / (logMax - logMin)));
+    const ry = 1 - Math.pow(Math.max(0, Math.min(1, vol / 0.4)), 1 / 1.7);
+    pointer01 = { x: snappedX, y: ry };
+
+    const rect = stage.getBoundingClientRect();
+    glow.style.left = (snappedX * rect.width) + 'px';
+    glow.style.top = (ry * rect.height) + 'px';
+    stage.style.setProperty('--mx', (snappedX * 100) + '%');
+    stage.style.setProperty('--my', (ry * 100) + '%');
+
+    hzOut.textContent = hz.toFixed(1) + ' Hz';
+    noteOut.textContent = nameOf(hz);
+
+    // Push a trail sample (normalised volume 0..1 for amplitude colour).
+    const ampN = Math.min(1, vol / 0.4);
+    trail.push({ x: snappedX, y: ry, hz, vol: ampN, t: performance.now() });
+    if (trail.length > TRAIL_MAX) trail.shift();
+  }
+
+  stage.addEventListener('pointerdown', (e) => {
+    ensure();
+    if (ctx.state === 'suspended') ctx.resume();
+    active = true;
+    pointerActive = true;
+    stage.setPointerCapture(e.pointerId);
+    glow.classList.add('on');
+    setFromPos(e.clientX, e.clientY);
+    hint.classList.add('hidden');
+  });
+  stage.addEventListener('pointermove', (e) => {
+    if (!pointerActive) return;
+    setFromPos(e.clientX, e.clientY);
+  });
+  const release = () => {
+    pointerActive = false;
+    if (activeNotes.length === 0) {
+      active = false;
+      setGain(0);
+      targetVol = 0;
+      glow.classList.remove('on');
+      noteOut.textContent = 'silent';
+    } else {
+      updateNoteFromActive();
+    }
+  };
+  stage.addEventListener('pointerup', release);
+  stage.addEventListener('pointercancel', release);
+  stage.addEventListener('pointerleave', release);
+
+  // MIDI and Keyboard state
+  const activeNotes = [];
+
+  function midiNoteToHz(note) {
+    return 440 * Math.pow(2, (note - 69) / 12);
+  }
+
+  function playNote(note, velocity) {
+    ensure();
+    if (ctx.state === 'suspended') ctx.resume();
+
+    const idx = activeNotes.findIndex(n => n.note === note);
+    if (idx !== -1) activeNotes.splice(idx, 1);
+    activeNotes.push({ note, velocity });
+
+    if (!pointerActive) {
+      updateNoteFromActive();
+    }
+  }
+
+  function stopNote(note) {
+    const idx = activeNotes.findIndex(n => n.note === note);
+    if (idx !== -1) {
+      activeNotes.splice(idx, 1);
+      if (!pointerActive) {
+        updateNoteFromActive();
+      }
+    }
+  }
+
+  function updateNoteFromActive() {
+    if (activeNotes.length === 0) {
+      active = false;
+      setGain(0);
+      targetVol = 0;
+      glow.classList.remove('on');
+      noteOut.textContent = 'silent';
+      return;
+    }
+
+    active = true;
+    glow.classList.add('on');
+    hint.classList.add('hidden');
+
+    const topNote = activeNotes[activeNotes.length - 1];
+    // We snap the frequency according to the selected scale
+    const hz = snapFreq(midiNoteToHz(topNote.note), scalePick.value);
+    const vol = (topNote.velocity / 127) * 0.4;
+
+    setFromHzAndVol(hz, vol);
+  }
+
+  const keyToNote = {
+    'z': 48, 's': 49, 'x': 50, 'd': 51, 'c': 52, 'v': 53, 'g': 54, 'b': 55, 'h': 56, 'n': 57, 'j': 58, 'm': 59, ',': 60,
+    'q': 60, '2': 61, 'w': 62, '3': 63, 'e': 64, 'r': 65, '5': 66, 't': 67, '6': 68, 'y': 69, '7': 70, 'u': 71, 'i': 72,
+    '9': 73, 'o': 74, '0': 75, 'p': 76, '[': 77, '=': 78, ']': 79
+  };
+
+  window.addEventListener('keydown', (e) => {
+    if (e.repeat || e.metaKey || e.ctrlKey || e.altKey) return;
+    const note = keyToNote[e.key.toLowerCase()];
+    if (note !== undefined) {
+      playNote(note, 100);
+    }
+  });
+
+  window.addEventListener('keyup', (e) => {
+    const note = keyToNote[e.key.toLowerCase()];
+    if (note !== undefined) {
+      stopNote(note);
+    }
+  });
+
+  if (navigator.requestMIDIAccess) {
+    navigator.requestMIDIAccess().then(access => {
+      const inputs = access.inputs.values();
+      for (let input of inputs) {
+        input.onmidimessage = (e) => {
+          const [status, note, vel] = e.data;
+          const cmd = status >> 4;
+          if (cmd === 9 && vel > 0) { // Note on
+            playNote(note, vel);
+          } else if (cmd === 8 || (cmd === 9 && vel === 0)) { // Note off
+            stopNote(note);
+          }
+        };
+      }
+      access.onstatechange = (e) => {
+        if (e.port.type === 'input' && e.port.state === 'connected') {
+          e.port.onmidimessage = (ev) => {
+            const [status, note, vel] = ev.data;
+            const cmd = status >> 4;
+            if (cmd === 9 && vel > 0) {
+              playNote(note, vel);
+            } else if (cmd === 8 || (cmd === 9 && vel === 0)) {
+              stopNote(note);
+            }
+          };
+        }
+      };
+    }).catch(() => {
+      console.log('Web MIDI API not supported or access denied.');
+    });
+  }
+
+  scalePick.addEventListener('change', () => {
+    buildGrid();
+    if (activeNotes.length > 0 && !pointerActive) {
+      updateNoteFromActive();
+    }
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      release();
+      activeNotes.length = 0;
+      updateNoteFromActive();
+    }
+  });
+
+  // ---------- Canvas sizing ----------
+  let W = 0, H = 0;
+  function resize() {
+    const rect = stage.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    fx.width = Math.max(1, Math.round(rect.width * dpr));
+    fx.height = Math.max(1, Math.round(rect.height * dpr));
+    fxc.setTransform(dpr, 0, 0, dpr, 0, 0);
+    W = rect.width; H = rect.height;
+    buildGrid();
+  }
+  window.addEventListener('resize', resize);
+
+  // ---------- Render loop ----------
+  // Smoothed colour values lerp toward the live note's pitchColor, à la Resonance.
+  let smHue = 210, smSat = 60, smLight = 20; // dark navy-ish at rest
+  // CSS custom-prop smoothing for the background radial + glow.
+  function lerpHue(cur, tgt, rate) {
+    let dh = tgt - cur;
+    if (dh > 180) dh -= 360;
+    if (dh < -180) dh += 360;
+    return ((cur + dh * rate) + 360) % 360;
+  }
+
+  function drawGridLayer() {
+    fxc.lineWidth = 1;
+    fxc.font = '11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    fxc.textBaseline = 'alphabetic';
+    for (const g of gridLines) {
+      const x = g.x01 * W;
+      const hue = pitchHue(g.hz);
+      // Faint rainbow ruler: octave lines a touch brighter than snap ticks.
+      const a = g.label ? 0.16 : (g.snap ? 0.14 : 0.08);
+      fxc.strokeStyle = `hsla(${hue}, 70%, 60%, ${a})`;
+      fxc.beginPath();
+      fxc.moveTo(x, 0);
+      fxc.lineTo(x, H);
+      fxc.stroke();
+      if (g.label) {
+        fxc.fillStyle = `hsla(${hue}, 55%, 70%, 0.5)`;
+        fxc.fillText(g.label, x + 4, H - 8);
+      }
+    }
+  }
+
+  function drawTrail() {
+    if (trail.length < 2) return;
+    const now = performance.now();
+    const LIFE = 900; // ms before a point fully fades
+    fxc.lineCap = 'round';
+    fxc.lineJoin = 'round';
+
+    // Two-pass per segment: a wide soft glow, then a bright core (Resonance feel).
+    for (let pass = 0; pass < 2; pass++) {
+      for (let i = 1; i < trail.length; i++) {
+        const a = trail[i - 1], b = trail[i];
+        const age = now - b.t;
+        if (age > LIFE) continue;
+        const fade = 1 - age / LIFE;          // newer = more opaque
+        const amp = b.vol;                    // 0..1
+        const baseAlpha = fade * (0.12 + amp * 0.7);
+        if (baseAlpha <= 0.01) continue;
+
+        const x1 = a.x * W, y1 = a.y * H;
+        const x2 = b.x * W, y2 = b.y * H;
+
+        if (pass === 0) {
+          // soft glow
+          fxc.strokeStyle = pitchColor(b.hz, amp, baseAlpha * 0.35);
+          fxc.lineWidth = 10 * fade * (0.4 + amp);
+          fxc.shadowBlur = 18 * fade;
+          fxc.shadowColor = pitchColor(b.hz, amp, baseAlpha * 0.6);
+        } else {
+          // bright core
+          fxc.strokeStyle = pitchColor(b.hz, Math.min(1, amp + 0.25), Math.min(1, baseAlpha + 0.2));
+          fxc.lineWidth = Math.max(1, 3 * fade * (0.5 + amp));
+          fxc.shadowBlur = 0;
+        }
+        fxc.beginPath();
+        fxc.moveTo(x1, y1);
+        fxc.lineTo(x2, y2);
+        fxc.stroke();
+      }
+    }
+    fxc.shadowBlur = 0;
+  }
+
+  function drawWaveformHalo(t) {
+    // A small oscilloscope ring at the trail head showing a few cycles of the
+    // current waveform, coloured by pitchColor and scaled by volume.
+    if (curVol < 0.005) return;
+    const px = pointer01.x * W;
+    const py = pointer01.y * H;
+    const amp = Math.min(1, curVol / 0.4);
+    const radius = 22 + amp * 30;
+    const cycles = 3;
+    const col = pitchColor(curHz, amp, 0.85);
+    const colSoft = pitchColor(curHz, amp, 0.4);
+
+    fxc.save();
+    fxc.translate(px, py);
+    fxc.lineCap = 'round';
+    fxc.lineJoin = 'round';
+
+    fxc.beginPath();
+    const steps = 96;
+    for (let i = 0; i <= steps; i++) {
+      const ang = (i / steps) * Math.PI * 2;
+      // Phase animation (held still under reduced motion).
+      const phase = reduceMotion ? 0 : t * 6;
+      const ph = ang * cycles + phase;
+      let wave;
+      switch (oscType) {
+        case 'square':   wave = Math.sign(Math.sin(ph)); break;
+        case 'sawtooth': wave = (((ph / Math.PI) % 2) + 2) % 2 - 1; break;
+        case 'triangle': wave = Math.abs((((ph / Math.PI) % 2) + 2) % 2 - 1) * 2 - 1; break;
+        default:         wave = Math.sin(ph);
+      }
+      const r = radius + wave * (6 + amp * 12);
+      const x = Math.cos(ang) * r;
+      const y = Math.sin(ang) * r;
+      if (i === 0) fxc.moveTo(x, y); else fxc.lineTo(x, y);
+    }
+    fxc.closePath();
+    fxc.shadowBlur = 16;
+    fxc.shadowColor = colSoft;
+    fxc.strokeStyle = col;
+    fxc.lineWidth = 1.6 + amp;
+    fxc.stroke();
+    fxc.shadowBlur = 0;
+    fxc.restore();
+  }
+
+  let tAccum = 0;
+  function render() {
+    tAccum += 0.015;
+
+    // Smooth audio state.
+    const interp = active ? 0.18 : 0.12;
+    curHz += (targetHz - curHz) * interp;
+    curVol += (targetVol - curVol) * interp;
+    const ampN = Math.min(1, curVol / 0.4);
+
+    // Lerp smoothed colour toward the live note's colour.
+    const targetHue = pitchHue(curHz);
+    const octavePos = Math.log2(Math.max(1e-6, curHz) / 65.41);
+    const targetSat = Math.min(100, 55 + Math.max(0, Math.min(5, octavePos)) * 6 + ampN * 25);
+    const targetLight = (active || curVol > 0.01) ? (24 + ampN * 30) : 18;
+    smHue = lerpHue(smHue, targetHue, 0.08);
+    smSat += (targetSat - smSat) * 0.08;
+    smLight += (targetLight - smLight) * 0.08;
+
+    // Drive the CSS radial + glow with smoothed colour.
+    const tintA = 0.06 + ampN * 0.30;
+    stage.style.setProperty('--glow-tint', `hsla(${smHue}, ${smSat}%, ${smLight + 12}%, ${tintA})`);
+    glow.style.setProperty('--glow-mid', `hsla(${smHue}, ${smSat}%, ${smLight + 28}%, 0.7)`);
+    glow.style.setProperty('--glow-shadow', `hsla(${smHue}, ${smSat}%, ${smLight + 18}%, 0.75)`);
+
+    // Tint the note readout by the live pitch colour.
+    if (curVol > 0.01) {
+      hzOut.style.color = pitchColor(curHz, ampN);
+      noteOut.style.color = `hsla(${smHue}, ${smSat}%, ${Math.min(75, smLight + 40)}%, 0.95)`;
+    } else {
+      hzOut.style.color = '';
+      noteOut.style.color = '';
+    }
+
+    // Clear and redraw the FX canvas.
+    fxc.clearRect(0, 0, W, H);
+    drawGridLayer();
+
+    if (!reduceMotion) {
+      drawTrail();
+    } else {
+      // Reduced-motion: a single calm head marker instead of the animated ribbon.
+      if (curVol > 0.01) {
+        const px = pointer01.x * W, py = pointer01.y * H;
+        fxc.beginPath();
+        fxc.arc(px, py, 8 + ampN * 8, 0, Math.PI * 2);
+        fxc.fillStyle = pitchColor(curHz, ampN, 0.5);
+        fxc.fill();
+      }
+    }
+    drawWaveformHalo(tAccum);
+
+    requestAnimationFrame(render);
+  }
+
+  resize();
+  requestAnimationFrame(render);
+</script>
+
+</body>
+</html>
